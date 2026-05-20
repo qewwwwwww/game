@@ -1,5 +1,3 @@
---俄亥俄州
-local ohio = function(...)
     secureCheck(...)
     game.TextChatService.ChatWindowConfiguration.Enabled = true
     local banned = game:GetService("ReplicatedStorage"):FindFirstChild("devv"):FindFirstChild("remoteStorage"):FindFirstChild("makeExplosion")
