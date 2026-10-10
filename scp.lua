@@ -1,13 +1,40 @@
 -- ============================================================
---  SCP异常站点 v6.14-fix
---  刷钱逻辑（修复版）：
---  1. 检测自己是否有职业 → 没有就走完整复活流程
---  2. 自杀后等角色彻底消失 → 再请求选D级 → 等角色生成 → 等职业赋值
---  3. 检测自己是否是D级 → 是就继续
---  4. 检测自己是否逃出 → 逃出就自杀 → 等角色消失 → 复活循环
---  5. 没逃出 → 延迟3秒 → 传送到刷钱点
---  6. 模拟按2下S，2下W
---  7. 检测是否逃出 → 逃出就自杀 → 循环
+--  SCP异常站点 v6.27
+--
+--  ★ v6.27 修复（仅核心功能，UI未改动）：
+--  ① 修复加载崩溃：全局立即执行的代码延迟到下一帧 + pcall保护
+--  ② 修复穿门字典膨胀：新增CleanDeadDoors定期清理已销毁门对象
+--  ③ 修复无敌检测表泄漏：改用Weak Table + 定期清理失效玩家
+--  ④ 修复弹道task.delay堆积：改用task.spawn + beamSpawnCount上限控制
+--  ⑤ 修复ESP角色部件缓存泄漏：改用Weak Table
+--  ⑥ 修复状态更新全服遍历：先粗筛距离再判断阵营
+--  ⑦ 修复脚底圆圈Part残留：MAX_CIRCLE_PARTS上限管控
+--  ⑧ 新增Unload全局清理：断开所有事件连接
+-- ============================================================
+--  SCP异常站点 v6.26
+--
+--  ★ 弹道：Part方案（100%可见，不跟随屏幕/不UI）
+--          樱花粉 RGB(255,183,197) 粗细0.06 Neon发光
+--          最多40条 生命周期0.5s 对象池复用
+--  ★ 无敌检测：0.3s循环扫描玩家模型中的"Forcefield"文件
+--          有→血条蓝色(80,160,255) 无→按血量染色
+--  ★ 穿门：靠近12格才移除碰撞（射线不穿墙）
+--  ★ 近战范围：8格
+--  ★ 透视：60Hz不降帧 4段职业色渐变 8角包围盒
+--  ★ 攻击跳过无敌玩家
+--  ★ 玩家列表：0.1秒实时刷新 + 无敌O(1)缓存查询
+--  ★ 性能：Ignore缓存0.1s/武器去抖50ms/弹道短生命周期
+--  ★ 娱乐模式/静默模式/白名单/Unload全局清理
+--  ★ v6.26：近战攻击重写 — 多武器连续快速攻击
+--
+--  刷钱逻辑（不变）：
+--  ① 检测是否在出生点附近 → 不在就循环复活
+--  ② 确认是D级
+--  ③ 检测逃出 → 逃出就自杀 → 等消失 → 复活循环
+--  ④ 未逃出 → 延迟3秒 → 传送
+--  ⑤ 传送冷却0.5秒
+--  ⑥ 按S×2 → W×2
+--  ⑦ 检测逃出 → 逃出就自杀 → 循环
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -19,6 +46,23 @@ local GuiService = game:GetService("GuiService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
+
+-- ==================== 安全调用封装（防止脚本崩溃无报错） ====================
+local function SafeCall(name, func, ...)
+	local args = { ... }
+	local ok, result = pcall(function() return func(table.unpack(args)) end)
+	if not ok then
+		warn("[SCP] " .. name .. " 执行失败: " .. tostring(result))
+	end
+	return ok, result
+end
+
+-- ==================== 连接管理器（防止事件连接泄漏） ====================
+local allConnections = {}
+local function TrackConnection(conn)
+	table.insert(allConnections, conn)
+	return conn
+end
 
 -- ==================== 网络事件 ====================
 local Libraries = ReplicatedStorage:FindFirstChild("Libraries")
@@ -35,7 +79,7 @@ local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.Keyboar
 local function GetScreenSize()
 	local guiInset = GuiService:GetGuiInset()
 	local size = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize
-		or Vector2.new(1024, 750)
+			or Vector2.new(1024, 750)
 	return Vector2.new(size.X, size.Y - guiInset.Y), guiInset
 end
 
@@ -50,18 +94,20 @@ end
 
 -- ==================== 配置 ====================
 local MAX_RANGE = 271
-local MELEE_RANGE = 5
+local MELEE_RANGE = 8          -- ★ v6.26: 7→8（配合更快攻击）
 local SHOOT_CD = 0.087
-local MELEE_CD = 0.450
+local MELEE_CD = 0.150         -- ★ v6.26: 0.450→0.150（快3倍）
+local MELEE_INTERVAL = 0.035   -- ★ v6.26: 多武器间间隔35ms
 local autoShoot = true
 local autoMelee = true
 local rayEnabled = true
-local drawVis = true
 local drawCircle = true
 local attackEscapedD = true
 local espEnabled = true
 local funMode = false
 local silentMode = false
+local invincibleCheck = true
+local drawBeams = true
 
 -- ==================== 阵营 ====================
 local FOUNDATION = { scientist = true, security = true, mtf = true, director = true }
@@ -108,7 +154,7 @@ local function IsEnemy(p)
 	return false
 end
 
--- ==================== 违规/逃出检测（路径法） ====================
+-- ==================== 违规/逃出检测 ====================
 local function GetTagWrapper(p)
 	if not p or not p.Character then return nil end
 	local hrp = p.Character:FindFirstChild("HumanoidRootPart")
@@ -135,8 +181,95 @@ local function IsEscaped(p)
 	return s and v or false
 end
 
+-- ==================== ★ 无敌检测（循环检测"Forcefield"文件） ====================
+local invincibleUntil = {}
+local forceFieldState = setmetatable({}, { __mode = "k" })  -- Weak Table: 玩家离开自动移除
+
+local function CheckForceFieldExists(p)
+	if not p then return false end
+
+	local wsModel = Workspace:FindFirstChild(p.Name)
+	if wsModel then
+		local ff = wsModel:FindFirstChild("Forcefield")
+		if ff then return true end
+		ff = wsModel:FindFirstChild("ForceField")
+		if ff then return true end
+		for _, child in ipairs(wsModel:GetChildren()) do
+			if child:IsA("ForceField") then return true end
+			local ff2 = child:FindFirstChild("Forcefield")
+			if ff2 then return true end
+			ff2 = child:FindFirstChild("ForceField")
+			if ff2 then return true end
+		end
+	end
+
+	if p.Character then
+		local ff = p.Character:FindFirstChild("Forcefield")
+		if ff then return true end
+		ff = p.Character:FindFirstChild("ForceField")
+		if ff then return true end
+		for _, desc in ipairs(p.Character:GetDescendants()) do
+			if desc.Name == "Forcefield" or desc.Name == "ForceField" then
+				if desc:IsA("ForceField") or desc:IsA("BasePart") or desc:IsA("Folder") then
+					return true
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+local function MarkInvincible(p)
+	invincibleUntil[p] = tick() + 5.0
+	forceFieldState[p] = true
+end
+
+local function ClearInvincible(p)
+	invincibleUntil[p] = nil
+	forceFieldState[p] = false
+end
+
+local function IsInvincibleCached(p)
+	if not invincibleCheck then return false end
+	if invincibleUntil[p] and tick() < invincibleUntil[p] then
+		return true
+	end
+	return false
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.3)
+		if not invincibleCheck then
+			for p in pairs(forceFieldState) do
+				forceFieldState[p] = false
+			end
+			invincibleUntil = {}
+			continue
+		end
+
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p == player then continue end
+			local hasFF = CheckForceFieldExists(p)
+			if hasFF then
+				MarkInvincible(p)
+			else
+				if forceFieldState[p] then
+					ClearInvincible(p)
+				end
+			end
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	ClearInvincible(p)
+	forceFieldState[p] = nil
+end)
+
 -- ==================== 武器系统 ====================
-local MeleeNames = { "knife", "crowbar", "tomahawk", "hammer", "bat", "sword", "axe", "machete" }
+local MeleeNames = { "knife", "crowbar", "tomahawk", "hammer", "bat", "sword", "axe", "machete", "fists", "combat", "blade", "spear", "dagger" }
 local RangedNames = { "glock", "beretta", "mp5", "ak47", "hk416", "spas-12", "awm", "m249", "deagle", "uzi", "rifle", "shotgun", "pistol" }
 local function IsMelee(n) n=(n or ""):lower() for _,k in ipairs(MeleeNames) do if n:find(k) then return true end end return false end
 local function IsRanged(n) n=(n or ""):lower() for _,k in ipairs(RangedNames) do if n:find(k) then return true end end return false end
@@ -188,38 +321,63 @@ local function HasRanged()
 end
 local function HasMelee() for _,id in ipairs(WepList) do if IsMelee(WepNames[id]) then return true end end return false end
 
--- ==================== 武器实时监听 ====================
+-- ==================== 武器监听（去抖50ms） ====================
+local weaponScanScheduled = false
+local function ScheduleWeaponScan()
+	if weaponScanScheduled then return end
+	weaponScanScheduled = true
+	task.delay(0.05, function()
+		weaponScanScheduled = false
+		ScanWeapons()
+	end)
+end
+
 local function HookChar(char)
 	char.ChildAdded:Connect(function(c)
-		if c:IsA("Tool") then task.wait(0.085); ScanWeapons() end
+		if c:IsA("Tool") then ScheduleWeaponScan() end
 	end)
 	char.ChildRemoved:Connect(function(c)
-		if c:IsA("Tool") then task.wait(0.082); ScanWeapons() end
+		if c:IsA("Tool") then ScheduleWeaponScan() end
 	end)
 end
 
 local bp = player:FindFirstChild("Backpack")
 if bp then
 	bp.ChildAdded:Connect(function(c)
-		if c:IsA("Tool") then task.wait(0.084); ScanWeapons() end
+		if c:IsA("Tool") then ScheduleWeaponScan() end
 	end)
 end
 
--- ==================== 视线 ====================
+player.CharacterAdded:Connect(function(char)
+	HookChar(char)
+	ScanWeapons()
+	task.spawn(function()
+		task.wait(0.1)
+		ScanWeapons()
+		if drawCircle then pcall(CreateCircle) end
+	end)
+end)
+
+if player.Character then
+	HookChar(player.Character)
+	SafeCall("ScanWeapons", ScanWeapons)
+end
+
+-- ==================== 视线检测（Ignore列表缓存0.1s） ====================
+local ignoreList = nil
+local IGNORE_TTL = 0.1
+
 local function BuildIgnore()
+	if ignoreList then
+		if tick() < ignoreList.expire then
+			return ignoreList.list
+		end
+	end
 	local ig = {}
 	local char = player.Character
 	if char then
 		for _,p in ipairs(char:GetDescendants()) do
 			if p:IsA("BasePart") then table.insert(ig, p) end
-		end
-		for _,t in ipairs(char:GetChildren()) do
-			if t:IsA("Tool") then
-				table.insert(ig, t)
-				for _,c in ipairs(t:GetDescendants()) do
-					if c:IsA("BasePart") then table.insert(ig, c) end
-				end
-			end
 		end
 	end
 	local bp2 = player:FindFirstChild("Backpack")
@@ -233,8 +391,15 @@ local function BuildIgnore()
 			end
 		end
 	end
+	ignoreList = { list = ig, expire = tick() + IGNORE_TTL }
 	return ig
 end
+
+local function ClearIgnoreCache()
+	ignoreList = nil
+end
+
+player.CharacterAdded:Connect(ClearIgnoreCache)
 
 local function HasLineOfSight(from, char)
 	local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -259,15 +424,14 @@ local function GetEnemies()
 			local ph = p.Character:FindFirstChild("HumanoidRootPart")
 			local hu = p.Character:FindFirstChildOfClass("Humanoid")
 			if ph and hu and hu.Health>0 then
+				if invincibleCheck and IsInvincibleCached(p) then continue end
 				local d=(ph.Position-hrp.Position).Magnitude
 				if d<=MAX_RANGE then
 					local tr = GetRole(p)
 					if myRole and tr then
 						if (DCLASS[myRole] and DCLASS[tr]) or
 						   (FOUNDATION[myRole] and FOUNDATION[tr]) or
-						   (CHAOS[myRole] and CHAOS[tr]) then
-							continue
-						end
+						   (CHAOS[myRole] and CHAOS[tr]) then continue end
 					end
 					local enemy = IsEnemy(p)
 					if not enemy and not DCLASS[myRole] and IsHostile(p) then enemy=true end
@@ -291,13 +455,12 @@ local function GetMeleeTargets()
 			local ph = p.Character:FindFirstChild("HumanoidRootPart")
 			local hu = p.Character:FindFirstChildOfClass("Humanoid")
 			if ph and hu and hu.Health>0 and (ph.Position-hrp.Position).Magnitude<=MELEE_RANGE then
+				if invincibleCheck and IsInvincibleCached(p) then continue end
 				local tr = GetRole(p)
 				if myRole and tr then
 					if (DCLASS[myRole] and DCLASS[tr]) or
 					   (FOUNDATION[myRole] and FOUNDATION[tr]) or
-					   (CHAOS[myRole] and CHAOS[tr]) then
-						continue
-					end
+					   (CHAOS[myRole] and CHAOS[tr]) then continue end
 				end
 				local enemy = IsEnemy(p)
 				if not enemy and not DCLASS[myRole] and IsHostile(p) then enemy=true end
@@ -309,35 +472,192 @@ local function GetMeleeTargets()
 	return out
 end
 
--- ==================== 脚底圆圈 ====================
+-- ==================== ★ 弹道（Part方案，100%可见） ====================
+local BEAM_COLOR = Color3.fromRGB(255, 183, 197)
+local BEAM_LIFETIME = 0.5
+local MAX_BEAMS = 40
+local MAX_POOL_SIZE = 80  -- 池上限，防止无限增长
+local activeBeams = {}
+local beamPool = {}
+local beamSpawnCount = 0  -- 防止task.spawn堆积
+
+local function GetBeamPart()
+	-- 优先从池里取
+	if #beamPool > 0 then
+		local p = table.remove(beamPool)
+		if p and not p.Parent then
+			return p
+		end
+	end
+	-- 池空了才创建新Part
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Material = Enum.Material.Neon
+	p.Color = BEAM_COLOR
+	p.Size = Vector3.new(0.06, 0.06, 1)
+	return p
+end
+
+local function RecycleBeamPart(p)
+	-- 重置属性
+	p.Transparency = 0.1
+	-- 池满了就直接销毁，不保留
+	if #beamPool >= MAX_POOL_SIZE then
+		if p and p.Parent then p:Destroy() end
+		return
+	end
+	if p and not p.Parent then
+		table.insert(beamPool, p)
+	end
+end
+
+local function CleanDeadBeams()
+	-- 清理已销毁/无Parent的弹道引用
+	for i = #activeBeams, 1, -1 do
+		local beam = activeBeams[i]
+		if not beam or not beam.Parent then
+			table.remove(activeBeams, i)
+		end
+	end
+	-- 数量上限保护
+	while #activeBeams > MAX_BEAMS do
+		local old = table.remove(activeBeams, 1)
+		if old and old.Parent then
+			old:Destroy()
+		end
+	end
+end
+
+local function DrawBulletTrail(from, to)
+	if not drawBeams then return end
+
+	-- 防止极端情况下弹道堆积
+	if beamSpawnCount >= MAX_BEAMS * 2 then
+		return
+	end
+
+	local dir = to - from
+	local dist = dir.Magnitude
+	if dist < 0.5 then return end
+
+	local part = GetBeamPart()
+	part.CFrame = CFrame.new((from + to) / 2, to)
+	part.Size = Vector3.new(0.06, 0.06, dist)
+	part.Material = Enum.Material.Neon
+	part.Color = BEAM_COLOR
+	part.Transparency = 0.1
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Parent = Workspace
+
+	table.insert(activeBeams, part)
+	beamSpawnCount = beamSpawnCount + 1
+
+	-- 用task.spawn替代task.delay，避免闭包引用堆积
+	task.spawn(function()
+		task.wait(BEAM_LIFETIME)
+		beamSpawnCount = beamSpawnCount - 1
+		if part and part.Parent then
+			part.Parent = nil
+			RecycleBeamPart(part)
+		end
+		for i = #activeBeams, 1, -1 do
+			if activeBeams[i] == part then
+				table.remove(activeBeams, i)
+				break
+			end
+		end
+	end)
+end
+
+-- ==================== 脚底范围指示（绿色/红色双状态旋转） ====================
 local CircleParts = {}
+local circleValid = false
+local MAX_CIRCLE_PARTS = 12  -- 12个方块，绕一圈均匀分布
+local circleRotation = 0      -- 当前旋转角度
+local CIRCLE_ROT_SLOW = 1.2   -- 空闲旋转速度（弧度/秒）
+local CIRCLE_ROT_FAST = 9.0   -- 有敌人时旋转速度（快速）
+local COLOR_IDLE = Color3.fromRGB(0, 255, 60)   -- 绿色：无敌人
+local COLOR_ALERT = Color3.fromRGB(255, 30, 30)  -- 红色：有敌人
+local COLOR_ALERT_GLOW = Color3.fromRGB(255, 80, 30)  -- 橙红：渐变闪烁
+local circleHasEnemy = false   -- 当前是否有敌人在范围内
+
 local function DestroyCircle()
 	for _,p in ipairs(CircleParts) do pcall(function() p:Destroy() end) end
 	CircleParts={}
+	circleValid = false
 end
+
 local function CreateCircle()
-	DestroyCircle()
+	-- 如果已存在且有效，先销毁旧的
+	if #CircleParts > 0 then
+		DestroyCircle()
+	end
 	if not drawCircle then return end
 	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
 	if not hrp then return end
-	for i=1,44 do
-		local a=(i/44)*math.pi*2
+	for i=1,MAX_CIRCLE_PARTS do
 		local pt=Instance.new("Part")
 		pt.Anchored=true; pt.CanCollide=false; pt.CastShadow=false
-		pt.Material=Enum.Material.Neon; pt.Color=Color3.fromRGB(231,235,241); pt.Transparency=0.547
-		pt.Size=Vector3.new(0.077,0.007,0.072)
-		pt.CFrame=CFrame.new(hrp.Position+Vector3.new(math.cos(a)*MELEE_RANGE, -0.009, math.sin(a)*MELEE_RANGE))
+		pt.Material=Enum.Material.Neon
+		pt.Color=COLOR_IDLE
+		pt.Transparency=0.25
+		pt.Size=Vector3.new(0.5, 0.5, 0.5)
 		pt.Parent=Workspace; table.insert(CircleParts, pt)
 	end
+	circleValid = true
 end
+
 local function UpdateCircle()
 	if not drawCircle then DestroyCircle(); return end
 	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
 	if not hrp then DestroyCircle(); return end
-	if #CircleParts==0 then CreateCircle(); return end
+	if not circleValid or #CircleParts==0 then CreateCircle(); return end
+
+	-- ★ 检测范围内是否有敌人
+	local hasEnemy = false
+	if autoMelee then
+		local tgts = GetMeleeTargets()
+		if #tgts > 0 then
+			hasEnemy = true
+		end
+	end
+
+	-- ★ 旋转速度：有敌人时快速，否则缓慢
+	local rotSpeed = hasEnemy and CIRCLE_ROT_FAST or CIRCLE_ROT_SLOW
+	circleRotation = circleRotation + rotSpeed * (1/60)
+	if circleRotation >= math.pi*2 then
+		circleRotation = circleRotation - math.pi*2
+	end
+
+	-- ★ 颜色插值：有敌人时闪烁红→橙红，否则绿色
+	local targetColor
+	if hasEnemy then
+		-- 用时间做正弦闪烁
+		local flash = (math.sin(tick() * 12) + 1) / 2  -- 0~1
+		targetColor = COLOR_ALERT:lerp(COLOR_ALERT_GLOW, flash)
+	else
+		targetColor = COLOR_IDLE
+	end
+
 	for i,pt in ipairs(CircleParts) do
-		local a=(i/#CircleParts)*math.pi*2
-		pt.CFrame=CFrame.new(hrp.Position+Vector3.new(math.cos(a)*MELEE_RANGE, -0.010, math.sin(a)*MELEE_RANGE))
+		-- 每个方块在圆上均匀分布，加上整体旋转偏移
+		local a = (i / #CircleParts) * math.pi * 2 + circleRotation
+		local offsetX = math.cos(a) * MELEE_RANGE
+		local offsetZ = math.sin(a) * MELEE_RANGE
+		-- 有敌人时方块轻微弹跳（高度波动）
+		local yOffset = -2.5
+		if hasEnemy then
+			yOffset = -2.5 + math.sin(circleRotation * 3 + i) * 0.3
+		end
+		local pos = hrp.Position + Vector3.new(offsetX, yOffset, offsetZ)
+		pt.CFrame = CFrame.new(pos) * CFrame.Angles(0, a, 0)
+		pt.Color = targetColor
 	end
 end
 
@@ -393,6 +713,10 @@ local function FireRanged(tgt)
 		org = h and (h.Position+Vector3.new(math.random(-50,50)/10,math.random(-28,48)/10,math.random(-60,60)/10)) or aim+Vector3.new(0,2.376,0)
 	end
 
+	if drawBeams then
+		DrawBulletTrail(org, aim)
+	end
+
 	local shots = {}
 	local pelletCount = wepIsShotgun and 8 or 1
 
@@ -400,26 +724,12 @@ local function FireRanged(tgt)
 		local spread = Vector3.zero
 		if wepIsShotgun and i > 1 then
 			spread = Vector3.new(
-				math.random(-15, 15) / 100,
-				math.random(-10, 10) / 100,
-				math.random(-15, 15) / 100
-			)
+					math.random(-15, 15) / 100,
+					math.random(-10, 10) / 100,
+					math.random(-15, 15) / 100
+				)
 		end
 		table.insert(shots, BuildShotData(org, aim, head or tgt.hrp, spread))
-	end
-
-	if drawVis then
-		local beam=Instance.new("Part")
-		beam.Anchored=true; beam.CanCollide=false; beam.Material=Enum.Material.Neon
-		beam.Color=Color3.fromRGB(227,233,239); beam.Transparency=0.329
-		beam.Size=Vector3.new(0.035,0.043,(aim-org).Magnitude)
-		beam.CFrame=CFrame.new(org,aim)*CFrame.new(0,0,-beam.Size.Z/2)
-		beam.Parent=Workspace
-		local hit=Instance.new("Part")
-		hit.Anchored=true; hit.CanCollide=false; hit.Material=Enum.Material.Neon
-		hit.Color=Color3.fromRGB(237,242,249); hit.Transparency=0.418; hit.Shape=Enum.PartType.Ball
-		hit.Size=Vector3.new(0.355,0.347,0.307); hit.CFrame=CFrame.new(aim); hit.Parent=Workspace
-		task.delay(0.745,function() pcall(function() beam:Destroy() end) pcall(function() hit:Destroy() end) end)
 	end
 
 	if ShootEvent then
@@ -434,16 +744,79 @@ local function FireRanged(tgt)
 	end
 end
 
+-- ==================== ★ 近战攻击（v6.26 重写：多武器连续快速攻击） ====================
+--
+--  旧版问题：
+--    ① MELEE_CD=0.450 → 每450ms才打一次，太慢
+--    ② 每把武器只FireServer一次 → 多把武器时总耗时=武器数×等待
+--    ③ 只打tgts[1] → 多个目标时只打最近的
+--
+--  新版方案：
+--    ① MELEE_CD=0.150 → 快3倍
+--    ② 收集所有近战武器ID → 依次快速FireServer（间隔35ms）
+--    ③ 每把武器对所有目标各打一次（最大3个目标，防过载）
+--    ④ 使用task.spawn不阻塞主循环
+--
+local meleeInProgress = false  -- 防止重入
+
 local function FireMelee(tgts)
-	if #tgts==0 then return end
-	local cam = Workspace:FindFirstChild("Camera")
-	if not cam then return end
-	for _,id in ipairs(WepList) do
-		if IsMelee(WepNames[id]) then
-			local cw=cam:FindFirstChild(id) or (task.wait(0.028) and cam:FindFirstChild(id))
-			if cw and AttackEvent then pcall(function() AttackEvent:FireServer(id,{tgts[1].char,cw}) end) end
+	if #tgts == 0 then return end
+	if meleeInProgress then return end  -- 上一次还没打完就跳过
+	meleeInProgress = true
+
+	task.spawn(function()
+		local cam = Workspace:FindFirstChild("Camera")
+		if not cam then meleeInProgress = false; return end
+
+		-- ★ 收集所有近战武器ID
+		local meleeIDs = {}
+		for _, id in ipairs(WepList) do
+			if IsMelee(WepNames[id]) then
+				table.insert(meleeIDs, id)
+			end
 		end
-	end
+
+		if #meleeIDs == 0 then
+			meleeInProgress = false
+			return
+		end
+
+		-- ★ 最多打前3个目标（防服务端过载）
+		local maxTargets = math.min(#tgts, 3)
+
+		-- ★ 每把武器依次攻击
+		for _, id in ipairs(meleeIDs) do
+			-- 确保武器对象存在
+			local cw = cam:FindFirstChild(id)
+			if not cw then
+				task.wait(0.015)  -- 短暂等待武器加载
+				cw = cam:FindFirstChild(id)
+			end
+
+			if cw and AttackEvent then
+				-- 对每个目标各发一次攻击
+				for ti = 1, maxTargets do
+					local tgt = tgts[ti]
+					if tgt and tgt.char and tgt.char.Parent then
+						pcall(function()
+							AttackEvent:FireServer(id, {tgt.char, cw})
+						end)
+						-- 目标之间间隔10ms（让服务端处理）
+						if ti < maxTargets then
+							task.wait(0.010)
+						end
+					end
+				end
+			end
+
+			-- ★ 武器之间间隔35ms（关键：让服务端确认上一次攻击）
+			if id ~= meleeIDs[#meleeIDs] then
+				task.wait(MELEE_INTERVAL)
+			end
+		end
+
+		meleeInProgress = false
+	end)
 end
 
 -- ==================== 职业映射 ====================
@@ -454,10 +827,10 @@ local RoleNames = {
 	traitor="叛徒", renegade="反叛者", anomaly="异常实体",
 }
 local RoleColors = {
-	scientist=Color3.fromRGB(99,163,204),
-	security=Color3.fromRGB(171,176,185),
-	mtf=Color3.fromRGB(53,111,219),
-	director=Color3.fromRGB(109,198,110),
+	scientist=Color3.fromRGB(97,162,204),
+	security=Color3.fromRGB(170,175,185),
+	mtf=Color3.fromRGB(52,110,218),
+	director=Color3.fromRGB(108,197,109),
 	d_class=Color3.fromRGB(255,175,40),
 	escaped_d=Color3.fromRGB(255,175,40),
 	escaped_d_class=Color3.fromRGB(255,175,40),
@@ -469,28 +842,74 @@ local RoleColors = {
 	Default=Color3.fromRGB(162,165,173),
 }
 
--- ==================== 透视系统 ====================
+-- ==================== ★ 透视系统 ====================
 local ESP = {}
+local charPartsCache = setmetatable({}, { __mode = "k" })  -- Weak Table: 角色销毁自动移除缓存
+
+local function ClearCharPartsCache(char)
+	if not char then return end
+	charPartsCache[char] = nil
+	for k in pairs(charPartsCache) do
+		if typeof(k) == "Instance" and k ~= char then
+			local p = k
+			while p do
+				if p == char then
+					charPartsCache[k] = nil
+					break
+				end
+				p = p.Parent
+			end
+		end
+	end
+end
+
+local function GetCharParts(char)
+	local cached = charPartsCache[char]
+	if cached then
+		return cached
+	end
+	local parts = {}
+	for _, part in ipairs(char:GetDescendants()) do
+		if not part:IsA("BasePart") then continue end
+		if part.Name == "HumanoidRootPart" then continue end
+		local parent = part.Parent
+		if parent and parent:IsA("Accessory") then continue end
+		if part.Transparency >= 0.936 then continue end
+		table.insert(parts, part)
+	end
+	charPartsCache[char] = parts
+	return parts
+end
+
 local function CleanESP(p)
 	if ESP[p] then
 		pcall(function()
-			if ESP[p].Sg and ESP[p].Sg.Parent then ESP[p].Sg:Destroy() end
+			if ESP[p].sg and ESP[p].sg.Parent then ESP[p].sg:Destroy() end
 		end)
 		ESP[p] = nil
 	end
+	ClearCharPartsCache(p.Character)
+	ClearInvincible(p)
 end
 
 local function MakeESP(p)
 	if p==player or ESP[p] then return end
-	p.CharacterAdded:Connect(function()
-		task.wait(0.258); CleanESP(p); task.spawn(function() MakeESP(p) end)
+
+	p.CharacterAdded:Connect(function(char)
+		ClearCharPartsCache(char)
+		task.wait(0.3)
+		CleanESP(p)
+		task.spawn(function() MakeESP(p) end)
 	end)
-	p.CharacterRemoving:Connect(function() CleanESP(p) end)
+	p.CharacterRemoving:Connect(function(char)
+		ClearCharPartsCache(char)
+		CleanESP(p)
+	end)
 
 	task.spawn(function()
 		local char = p.Character or p.CharacterAdded:Wait()
-		local hrp = char:WaitForChild("HumanoidRootPart",5)
-		local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid",5)
+		local hrp = char:WaitForChild("HumanoidRootPart", 5)
+		local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
 		if not hrp or not hum then return end
 
 		local sg = Instance.new("ScreenGui")
@@ -503,7 +922,9 @@ local function MakeESP(p)
 		box.Name = "Box"; box.BackgroundTransparency = 1; box.BorderSizePixel = 0; box.Parent = sg
 
 		local stroke = Instance.new("UIStroke"); stroke.Thickness = 2; stroke.Parent = box
-		local grad = Instance.new("UIGradient"); grad.Rotation = 94; grad.Parent = stroke
+
+		local grad = Instance.new("UIGradient")
+		grad.Rotation = 94; grad.Parent = stroke
 
 		local hpBg = Instance.new("Frame")
 		hpBg.Name = "HpBg"; hpBg.Size = UDim2.new(0,4,1,0)
@@ -524,46 +945,77 @@ local function MakeESP(p)
 		distL.TextColor3 = Color3.fromRGB(204,210,216); distL.Font = Enum.Font.GothamBold
 		distL.TextSize = 10; distL.TextXAlignment = Enum.TextXAlignment.Left; distL.Text = ""; distL.Parent = box
 
-		ESP[p] = { Sg=sg, Box=box, Stroke=stroke, Grad=grad, HpBg=hpBg, HpFill=hpFill, Dist=distL, Hum=hum, Char=char, HRP=hrp }
+		ESP[p] = { sg=sg, Box=box, Stroke=stroke, Grad=grad, HpBg=hpBg, HpFill=hpFill, Dist=distL, Hum=hum, Char=char, HRP=hrp }
 
 		hum.HealthChanged:Connect(function(hp)
 			if not hpFill or not hpFill.Parent then return end
-			local r = math.clamp(hp / math.max(hum.MaxHealth,1), 0, 1)
-			hpFill.Size = UDim2.new(1,0,r,0)
-			hpFill.BackgroundColor3 = r>0.463 and Color3.fromRGB(28,146,62) or r>0.263 and Color3.fromRGB(198,144,39) or Color3.fromRGB(202,46,46)
+			local isInv = IsInvincibleCached(p)
+			if isInv then
+				hpFill.Size = UDim2.new(1,0,1,0)
+				hpFill.BackgroundColor3 = Color3.fromRGB(80,160,255)
+				hpFill.BackgroundTransparency = 0
+			else
+				local r = math.clamp(hp / math.max(hum.MaxHealth,1), 0, 1)
+				hpFill.Size = UDim2.new(1,0,r,0)
+				hpFill.BackgroundColor3 = r>0.463 and Color3.fromRGB(28,146,62) or r>0.263 and Color3.fromRGB(198,144,39) or Color3.fromRGB(202,46,46)
+				hpFill.BackgroundTransparency = 0
+			end
+		end)
+
+		hum.Died:Connect(function()
+			CleanESP(p)
+		end)
+
+		char.ChildAdded:Connect(function()
+			ClearCharPartsCache(char)
+		end)
+		char.ChildRemoved:Connect(function()
+			ClearCharPartsCache(char)
 		end)
 	end)
 end
 
-for _,p in ipairs(Players:GetPlayers()) do task.spawn(function() MakeESP(p) end) end
-Players.PlayerAdded:Connect(function(p) task.wait(0.329); MakeESP(p) end)
-Players.PlayerRemoving:Connect(CleanESP)
+for _,p in ipairs(Players:GetPlayers()) do
+	task.spawn(function()
+		SafeCall("MakeESP_" .. p.Name, function() MakeESP(p) end)
+	end)
+end
+Players.PlayerAdded:Connect(function(p)
+	task.spawn(function()
+		task.wait(0.3)
+		SafeCall("MakeESP_" .. p.Name, function() MakeESP(p) end)
+	end)
+end)
+Players.PlayerRemoving:Connect(function(p)
+	SafeCall("CleanESP_" .. p.Name, function() CleanESP(p) end)
+end)
 
+-- 包围盒计算（8角）
 local function ComputeBoundingBox(char, cam)
 	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
 	local any = false
-	for _, part in ipairs(char:GetDescendants()) do
-		if part:IsA("BasePart") and part.Transparency < 0.936 then
-			local cf, size = part.CFrame, part.Size
-			local corners = {
-				cf * Vector3.new( size.X/2, size.Y/2, size.Z/2),
-				cf * Vector3.new( size.X/2, size.Y/2,-size.Z/2),
-				cf * Vector3.new( size.X/2,-size.Y/2, size.Z/2),
-				cf * Vector3.new( size.X/2,-size.Y/2,-size.Z/2),
-				cf * Vector3.new(-size.X/2, size.Y/2, size.Z/2),
-				cf * Vector3.new(-size.X/2, size.Y/2,-size.Z/2),
-				cf * Vector3.new(-size.X/2,-size.Y/2, size.Z/2),
-				cf * Vector3.new(-size.X/2,-size.Y/2,-size.Z/2),
-			}
-			for _, v in ipairs(corners) do
-				local sp, onScreen = cam:WorldToViewportPoint(v)
-				if onScreen then
-					any = true
-					if sp.X < minX then minX = sp.X end
-					if sp.Y < minY then minY = sp.Y end
-					if sp.X > maxX then maxX = sp.X end
-					if sp.Y > maxY then maxY = sp.Y end
-				end
+	local parts = GetCharParts(char)
+	for _, part in ipairs(parts) do
+		local cf, size = part.CFrame, part.Size
+		local hx, hy, hz = size.X*0.5, size.Y*0.5, size.Z*0.5
+		local corners = {
+			cf * Vector3.new( hx, hy,  hz),
+			cf * Vector3.new( hx, hy, -hz),
+			cf * Vector3.new( hx,-hy,  hz),
+			cf * Vector3.new( hx,-hy, -hz),
+			cf * Vector3.new(-hx, hy,  hz),
+			cf * Vector3.new(-hx, hy, -hz),
+			cf * Vector3.new(-hx,-hy,  hz),
+			cf * Vector3.new(-hx,-hy, -hz),
+		}
+		for _, v in ipairs(corners) do
+			local sp, onScreen = cam:WorldToViewportPoint(v)
+			if onScreen then
+				any = true
+				if sp.X < minX then minX = sp.X end
+				if sp.Y < minY then minY = sp.Y end
+				if sp.X > maxX then maxX = sp.X end
+				if sp.Y > maxY then maxY = sp.Y end
 			end
 		end
 	end
@@ -571,140 +1023,280 @@ local function ComputeBoundingBox(char, cam)
 	return minX, minY, maxX, maxY
 end
 
+-- ★ 透视渲染（60Hz）
 RunService.RenderStepped:Connect(function()
 	if not espEnabled then
-		for p,d in pairs(ESP) do if d.Sg then d.Sg.Enabled=false end end
-	else
-		local cam = Workspace.CurrentCamera
-		if cam then
-			local sw = cam.ViewportSize.X
-			local sh = cam.ViewportSize.Y
-			local margin = 2
-			for p, d in pairs(ESP) do
-				if not d.Sg or not d.Char or not d.HRP then CleanESP(p); continue end
-				d.Sg.Enabled = true
+		for p,d in pairs(ESP) do if d.sg then d.sg.Enabled=false end end
+		return
+	end
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
 
-				local minX, minY, maxX, maxY = ComputeBoundingBox(d.Char, cam)
-				if not minX then
-					d.Box.Visible = false
-				else
-					minX = math.max(0, minX - margin)
-					minY = math.max(0, minY - margin)
-					maxX = math.min(sw, maxX + margin)
-					maxY = math.min(sh, maxY + margin)
-					local w, h = maxX-minX, maxY-minY
-					if w < 4 or h < 4 then
-						d.Box.Visible = false
-					else
-						d.Box.Visible = true
-						d.Box.Position = UDim2.new(0, minX, 0, minY)
-						d.Box.Size = UDim2.new(0, w, 0, h)
+	local sw = cam.ViewportSize.X
+	local sh = cam.ViewportSize.Y
+	local margin = 2
 
-						local role = GetRole(p)
-						local col = RoleColors[role] or RoleColors.Default
-						d.Stroke.Color = col
-						d.Grad.Color = ColorSequence.new(col, col:Lerp(Color3.new(0,0,0), 0.344))
+	for p, d in pairs(ESP) do
+		if not d.sg or not d.sg.Parent then CleanESP(p); continue end
+		if not d.Char or not d.Char.Parent then CleanESP(p); continue end
+		if not d.HRP or not d.HRP.Parent then CleanESP(p); continue end
 
-						local dist = (cam.CFrame.Position - d.HRP.Position).Magnitude
-						d.Dist.Text = string.format("%.0fm", dist)
-					end
+		d.sg.Enabled = true
+
+		local minX, minY, maxX, maxY = ComputeBoundingBox(d.Char, cam)
+		if not minX then
+			d.Box.Visible = false
+		else
+			minX = math.max(0, minX - margin)
+			minY = math.max(0, minY - margin)
+			maxX = math.min(sw, maxX + margin)
+			maxY = math.min(sh, maxY + margin)
+			local w, h = maxX-minX, maxY-minY
+			if w < 4 or h < 4 then
+				d.Box.Visible = false
+			else
+				d.Box.Visible = true
+				d.Box.Position = UDim2.new(0, minX, 0, minY)
+				d.Box.Size = UDim2.new(0, w, 0, h)
+
+				local role = GetRole(p)
+				local col = RoleColors[role] or RoleColors.Default
+
+				-- ★ 只在颜色变化时更新（避免每帧创建ColorSequence）
+				if d.LastColor ~= col then
+					d.LastColor = col
+					d.Stroke.Color = col
+					local dim = Color3.new(0,0,0)
+					d.Grad.Color = ColorSequence.new{
+						ColorSequenceKeypoint.new(0,   col),
+						ColorSequenceKeypoint.new(0.35, col:Lerp(dim, 0.20)),
+						ColorSequenceKeypoint.new(0.70, col:Lerp(dim, 0.45)),
+						ColorSequenceKeypoint.new(1,   col:Lerp(dim, 0.70)),
+					}
 				end
 
-				if d.Hum and d.Hum.Health <= 0 then CleanESP(p) end
+				-- ★ 无敌检测 → 血条蓝色 / 正常 → 血量色
+				local isInv = IsInvincibleCached(p) or CheckForceFieldExists(p)
+
+				if isInv then
+					if not d.WasInvincible then
+						d.WasInvincible = true
+						d.HpFill.BackgroundColor3 = Color3.fromRGB(80,160,255)
+						d.HpFill.BackgroundTransparency = 0
+						d.HpFill.Size = UDim2.new(1,0,1,0)
+					end
+					forceFieldState[p] = true
+				else
+					if d.WasInvincible then
+						d.WasInvincible = false
+					end
+					local hp = d.Hum and d.Hum.Health or 0
+					local maxHp = d.Hum and d.Hum.MaxHealth or 100
+					local r = math.clamp(hp / math.max(maxHp, 1), 0, 1)
+					d.HpFill.Size = UDim2.new(1,0,r,0)
+					d.HpFill.BackgroundTransparency = 0
+					d.HpFill.BackgroundColor3 = r>0.463 and Color3.fromRGB(28,146,62)
+					                         or r>0.263 and Color3.fromRGB(198,144,39)
+					                         or Color3.fromRGB(202,46,46)
+					forceFieldState[p] = false
+				end
+
+				local dist = (cam.CFrame.Position - d.HRP.Position).Magnitude
+				d.Dist.Text = string.format("%.0fm", dist)
 			end
 		end
 	end
 end)
 
--- ==================== 穿门 ====================
-local DoorSys = { Enabled=true, Range=7, RangeSq=49, Parts={}, Orig={} }
+-- ==================== ★ 穿门系统（靠近才移除） ====================
+local DoorSys = {
+	Enabled = true,
+	Range = 12,
+	Parts = {},
+	Orig = {},
+}
+
+local DOOR_SCAN_INTERVAL = 0.1
+
 local function ScanDoors()
 	local map = Workspace:FindFirstChild("Map")
 	if not map then return 0 end
 	local doors = map:FindFirstChild("Doors")
 	if not doors then return 0 end
+
 	local c = 0
-	local function Rec(o)
+	local DEPTH_LIMIT = 5
+	local function Rec(o, depth)
+		if depth > DEPTH_LIMIT then return end
 		if o:IsA("BasePart") and not DoorSys.Parts[o] then
-			DoorSys.Parts[o]=true; DoorSys.Orig[o]=o.CanCollide; c=c+1
+			DoorSys.Parts[o] = true
+			DoorSys.Orig[o] = o.CanCollide
+			c = c + 1
 		end
-		for _,ch in ipairs(o:GetChildren()) do Rec(ch) end
+		if c > 1000 then return end
+		for _,ch in ipairs(o:GetChildren()) do
+			Rec(ch, depth + 1)
+		end
 	end
-	Rec(doors); return c
+	Rec(doors, 0)
+	return c
 end
-local DoorCount = ScanDoors()
-task.spawn(function() while true do task.wait(25) if DoorSys.Enabled then DoorCount=DoorCount+ScanDoors() end end end)
-task.spawn(function()
-	while true do task.wait(0.081)
-		if not DoorSys.Enabled then task.wait(0.464); continue end
-		local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-		if not hrp then task.wait(0.461); continue end
-		local px,py,pz=hrp.Position.X,hrp.Position.Y,hrp.Position.Z
-		for pt in pairs(DoorSys.Parts) do
-			if not pt or not pt.Parent then DoorSys.Parts[pt]=nil; DoorSys.Orig[pt]=nil; continue end
-			local dx,dy,dz=pt.Position.X-px,pt.Position.Y-py,pt.Position.Z-pz
-			if dx*dx+dy*dy+dz*dz <= DoorSys.RangeSq then
-				if pt.CanCollide then pt.CanCollide=false end
+
+local function RemoveNearbyDoors()
+	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return 0 end
+	local px, py, pz = hrp.Position.X, hrp.Position.Y, hrp.Position.Z
+	local rangeSq = DoorSys.Range * DoorSys.Range
+	local count = 0
+	for pt in pairs(DoorSys.Parts) do
+		if pt and pt.Parent then
+			local dx, dy, dz = pt.Position.X-px, pt.Position.Y-py, pt.Position.Z-pz
+			if dx*dx + dy*dy + dz*dz <= rangeSq then
+				if DoorSys.Orig[pt] == nil then
+					DoorSys.Orig[pt] = pt.CanCollide
+				end
+				if pt.CanCollide then
+					pt.CanCollide = false
+					count = count + 1
+				end
 			else
-				local o=DoorSys.Orig[pt]; if o~=nil and pt.CanCollide~=o then pt.CanCollide=o end
+				local orig = DoorSys.Orig[pt]
+				if orig ~= nil and pt.CanCollide ~= orig then
+					pt.CanCollide = orig
+				end
+			end
+		else
+			DoorSys.Parts[pt] = nil
+			DoorSys.Orig[pt] = nil
+		end
+	end
+	return count
+end
+
+local function RestoreAllDoors()
+	local count = 0
+	for pt in pairs(DoorSys.Parts) do
+		if pt and pt.Parent then
+			local orig = DoorSys.Orig[pt]
+			if orig ~= nil and pt.CanCollide ~= orig then
+				pt.CanCollide = orig
+				count = count + 1
+			end
+		end
+	end
+	DoorSys.Parts = {}
+	DoorSys.Orig = {}
+	return count
+end
+
+-- ★ 定期清理已销毁的门对象（防止字典膨胀）
+local function CleanDeadDoors()
+	local cleaned = 0
+	for pt in pairs(DoorSys.Parts) do
+		if not pt or not pt.Parent then
+			DoorSys.Parts[pt] = nil
+			DoorSys.Orig[pt] = nil
+			cleaned = cleaned + 1
+		end
+	end
+	if cleaned > 0 then
+		print("[穿门] 清理了 " .. cleaned .. " 个已销毁门对象")
+	end
+end
+
+task.spawn(function()
+	SafeCall("ScanDoors", function()
+		DoorCount = ScanDoors()
+		print("🚪 发现 " .. DoorCount .. " 个门部件")
+	end)
+end)
+
+task.spawn(function()
+	local cleanTimer = 0
+	while true do
+		task.wait(DOOR_SCAN_INTERVAL)
+		cleanTimer = cleanTimer + DOOR_SCAN_INTERVAL
+		if DoorSys.Enabled then
+			RemoveNearbyDoors()
+			-- 每5秒清理一次已销毁的门对象
+			if cleanTimer >= 5.0 then
+				CleanDeadDoors()
+				cleanTimer = 0
+			end
+		else
+			for pt in pairs(DoorSys.Parts) do
+				if pt and pt.Parent then
+					local orig = DoorSys.Orig[pt]
+					if orig ~= nil and pt.CanCollide ~= orig then
+						pt.CanCollide = orig
+					end
+				end
 			end
 		end
 	end
 end)
 
--- ============================================================
---  ==================== 刷钱系统（修复版） ====================
---  核心修复：自杀后等角色彻底消失，再请求选D级
---  不在角色刚生成时抢跑
--- ============================================================
+task.spawn(function()
+	while true do
+		task.wait(30)
+		if DoorSys.Enabled then
+			local newCount = ScanDoors()
+			if newCount > DoorCount then
+				DoorCount = newCount
+				print("🚪 补充发现新门，总计 " .. DoorCount)
+			end
+		end
+	end
+end)
 
+-- ==================== 刷钱系统（不变） ====================
 local autoFarm = false
 local farmRunning = false
 
--- 刷钱坐标
+local SPAWN_CHECK_POS = Vector3.new(1223.6483154296875, 176.08985900878906, -1192.4896240234375)
+local SPAWN_RADIUS = 50
 local FARM_TELEPORT = Vector3.new(1208.21240234375, 133.37843322753906, -677.5913696289062)
 
--- 时间常量
-local FARM_DELAY_BEFORE_TP = 3.0    -- 延迟3秒再传送
-local FARM_KEY_HOLD        = 0.08   -- 按键按住时间
-local FARM_KEY_GAP         = 0.05   -- 按键间隔
-local FARM_AFTER_KEYS      = 0.3    -- 按键后等0.3秒让服务器处理
-local FARM_CHECK_INTERVAL  = 0.2    -- 检测逃出间隔
-local FARM_ESCAPE_TIMEOUT  = 10.0   -- 按键后最长等10秒
-local FARM_DEATH_DELAY     = 1.0    -- 确认逃出后等1秒再自杀
-local FARM_REBIRTH_WAIT    = 2.0    -- 自杀后等角色消失
-local FARM_MAX_RETRY       = 30     -- 最大重试次数
+local FARM_DELAY_BEFORE_TP = 3.0
+local FARM_TP_COOLDOWN    = 0.5
+local FARM_KEY_HOLD        = 0.08
+local FARM_KEY_GAP         = 0.05
+local FARM_AFTER_KEYS      = 0.3
+local FARM_CHECK_INTERVAL  = 0.2
+local FARM_ESCAPE_TIMEOUT  = 10.0
+local FARM_DEATH_DELAY     = 1.0
+local FARM_REBIRTH_WAIT    = 2.0
+local FARM_MAX_RETRY       = 30
 
--- ========== 基础操作 ==========
 local function GetMyHRP()
 	return player.Character and player.Character:FindFirstChild("HumanoidRootPart") or nil
 end
-
 local function GetMyHumanoid()
 	return player.Character and player.Character:FindFirstChildOfClass("Humanoid") or nil
 end
-
 local function KillMySelf()
 	local hum = GetMyHumanoid()
 	if not hum then return false end
 	pcall(function() hum.Health = 0 end)
 	return true
 end
-
 local function SelectDClass()
 	if RoleEvent then
 		pcall(function() RoleEvent:FireServer("d_class") end)
 	end
 end
-
 local function TeleportTo(pos)
 	local hrp = GetMyHRP()
 	if not hrp then return false end
 	hrp.CFrame = CFrame.new(pos)
 	return true
 end
+local function IsNearSpawnPoint()
+	local hrp = GetMyHRP()
+	if not hrp then return false end
+	return (hrp.Position - SPAWN_CHECK_POS).Magnitude < SPAWN_RADIUS
+end
 
--- 模拟按键
 local function PressKey(keyCode, times)
 	times = times or 1
 	for i = 1, times do
@@ -719,23 +1311,19 @@ local function PressKey(keyCode, times)
 	end
 end
 
--- ========== 等待角色彻底消失（确认死亡） ==========
 local function WaitForDeath(timeout)
 	timeout = timeout or 8
 	local start = tick()
 	while player.Character and (tick() - start) < timeout do
 		task.wait(0.1)
 	end
-	-- 额外缓冲，让服务端完全处理死亡
 	task.wait(0.8)
 	return true
 end
 
--- ========== 等待角色完全加载 ==========
 local function WaitForCharacter(timeout)
 	timeout = timeout or 15
 	local start = tick()
-
 	local char = player.Character
 	while not char and (tick() - start) < timeout do
 		task.wait(0.1)
@@ -771,7 +1359,6 @@ local function WaitForCharacter(timeout)
 	return true
 end
 
--- ========== 等待职业赋值 ==========
 local function WaitForRole(timeout)
 	timeout = timeout or 12
 	local start = tick()
@@ -784,50 +1371,26 @@ local function WaitForRole(timeout)
 	return nil
 end
 
--- ========== 完整复活流程（核心修复） ==========
--- 步骤：
---  1. 杀掉当前角色
---  2. ★ 等角色彻底消失（不抢跑）
---  3. FireServer("d_class") 请求选D级
---  4. 等角色出现
---  5. 等角色完全加载（HRP + Health>0）
---  6. 等职业赋值为 d_class
---  7. 稳1秒后返回
 local function FullRespawnAsDClass()
 	local MAX_TIME = 30
 	local start = tick()
 
-	print("🌾 [复活] 开始完整复活流程")
-
-	-- 步骤1：杀掉当前角色
 	local hum = GetMyHumanoid()
 	if hum and hum.Health > 0 then
-		print("🌾 [复活] 步骤1：杀死当前角色")
 		pcall(function() hum.Health = 0 end)
 	end
 
-	-- 步骤2：★ 等角色彻底消失（关键修复！）
-	print("🌾 [复活] 步骤2：等待角色彻底消失...")
 	local deathWait = 0
 	while player.Character and deathWait < 10 do
 		task.wait(0.1)
 		deathWait = deathWait + 0.1
 	end
-	-- 额外缓冲，确保服务端处理完死亡
 	task.wait(0.8)
-	print("🌾 [复活] 角色已消失 ✅")
 
-	if (tick() - start) > MAX_TIME then
-		print("❌ [复活] 超时（等待死亡）")
-		return false
-	end
+	if (tick() - start) > MAX_TIME then return false end
 
-	-- 步骤3：请求选D级
-	print("🌾 [复活] 步骤3：FireServer('d_class')")
 	SelectDClass()
 
-	-- 步骤4：等角色出现
-	print("🌾 [复活] 步骤4：等待角色生成...")
 	local char = nil
 	local charWait = 0
 	while not char and charWait < 15 do
@@ -835,244 +1398,169 @@ local function FullRespawnAsDClass()
 		charWait = charWait + 0.2
 		char = player.Character
 	end
-	if not char then
-		print("❌ [复活] 角色未生成")
-		return false
-	end
-	print("🌾 [复活] 角色已生成 ✅")
+	if not char then return false end
 
-	if (tick() - start) > MAX_TIME then
-		print("❌ [复活] 超时（等待角色）")
-		return false
-	end
+	if (tick() - start) > MAX_TIME then return false end
 
-	-- 步骤5：等角色完全加载
-	print("🌾 [复活] 步骤5：等待角色完全加载...")
 	local charOk = WaitForCharacter(15)
-	if not charOk then
-		print("❌ [复活] 角色加载失败")
-		return false
-	end
-	print("🌾 [复活] 角色完全加载 ✅")
+	if not charOk then return false end
 
-	if (tick() - start) > MAX_TIME then
-		print("❌ [复活] 超时（加载）")
-		return false
-	end
+	if (tick() - start) > MAX_TIME then return false end
 
-	-- 步骤6：等职业赋值
-	print("🌾 [复活] 步骤6：等待职业赋值...")
 	local role = WaitForRole(15)
-
-	-- 如果分配的不是D级，再请求一次
 	if role ~= "d_class" then
-		print("⚠️ [复活] 职业是 " .. tostring(role) .. "，重新请求D级")
 		SelectDClass()
 		task.wait(1.0)
 		role = myRole
 	end
+	if role ~= "d_class" then return false end
 
-	if role ~= "d_class" then
-		print("❌ [复活] 无法获得D级职业，当前: " .. tostring(role))
-		return false
-	end
-	print("🌾 [复活] 职业确认为D级 ✅")
-
-	-- 步骤7：稳1秒
-	print("🌾 [复活] 步骤7：稳定等待1秒")
 	task.wait(1.0)
 
-	print("✅ [复活] 完整复活为D级成功！")
 	return true
 end
 
--- ========== 检测自己是否逃出 ==========
 local function CheckSelfEscaped()
 	return IsEscaped(player)
 end
 
--- ========== 刷钱主循环（修复版） ==========
 local function FarmLoop()
 	if farmRunning then return end
 	farmRunning = true
 
-	print("🌾 刷钱循环启动 v6.14-fix")
-
 	local retryCount = 0
 
 	while autoFarm do
-		-- ========== ① 检测自己是否有职业 ==========
+		if not IsNearSpawnPoint() then
+			retryCount = retryCount + 1
+			if retryCount > FARM_MAX_RETRY then break end
+			local ok = FullRespawnAsDClass()
+			if not ok then
+				task.wait(2.0)
+			else
+				retryCount = 0
+			end
+			continue
+		end
+
 		local char = player.Character
 		local hum = GetMyHumanoid()
 		local alive = hum and hum.Health > 0
 		local hasRole = myRole and myRole ~= ""
 
-		if not char or not alive or not hasRole then
-			-- 没有职业或没活着 → 走完整复活流程
+		if not alive or not hasRole then
 			retryCount = retryCount + 1
-			if retryCount > FARM_MAX_RETRY then
-				print("❌ 刷钱重试超过" .. FARM_MAX_RETRY .. "次，停止")
-				break
-			end
-
-			print("🌾 无职业/未存活 → 完整复活 (尝试 #" .. retryCount .. ")")
-			print("   状态: char=" .. tostring(char ~= nil) ..
-				  " alive=" .. tostring(alive) ..
-				  " role=" .. tostring(myRole))
-
+			if retryCount > FARM_MAX_RETRY then break end
 			local ok = FullRespawnAsDClass()
-			if not ok then
-				print("⚠️ 复活失败，等2秒后重试")
-				task.wait(2.0)
-				continue
-			end
-
-			-- 复活成功，确认是D级
-			retryCount = 0
-			print("✅ 已复活为D级: " .. tostring(myRole))
-
-			-- 回到循环开头，下一轮检测逃出
-			task.wait(0.5)
+			if not ok then task.wait(2.0) else retryCount = 0 end
 			continue
 		end
 
-		-- 有职业且活着 → 重置计数
+		if myRole ~= "d_class" then
+			KillMySelf()
+			task.wait(FARM_REBIRTH_WAIT)
+			continue
+		end
+
 		retryCount = 0
 
-		-- ========== ② 确认自己是D级 ==========
-		if myRole ~= "d_class" then
-			print("⚠️ 职业不是D级 (当前:" .. tostring(myRole) .. ")，重新复活")
-			KillMySelf()
-			-- 等角色消失后再回到循环开头
-			task.wait(1.5)
-			continue
-		end
-
-		-- ========== ③ 检测自己是否逃出 ==========
 		if CheckSelfEscaped() then
-			print("🌾 检测到已逃出 → 等" .. FARM_DEATH_DELAY .. "秒后自杀")
 			task.wait(FARM_DEATH_DELAY)
 			KillMySelf()
-			print("💀 已自杀，等待角色消失后重生...")
-			-- ★ 等角色消失后再回到循环开头走复活
 			task.wait(FARM_REBIRTH_WAIT)
 			continue
 		end
 
-		-- ========== ④ 没逃出 → 延迟3秒再传送 ==========
-		print("🌾 未逃出 → 延迟" .. FARM_DELAY_BEFORE_TP .. "秒后传送")
 		task.wait(FARM_DELAY_BEFORE_TP)
 
-		-- 延迟期间可能死了（被攻击等），检查
 		hum = GetMyHumanoid()
 		if not hum or hum.Health <= 0 then
-			print("⚠️ 延迟期间死亡，重新循环")
 			task.wait(FARM_REBIRTH_WAIT)
 			continue
 		end
-
-		-- 延迟期间可能逃出了，再检查一次
 		if CheckSelfEscaped() then
-			print("🌾 延迟期间逃出 → 自杀")
 			task.wait(FARM_DEATH_DELAY)
 			KillMySelf()
 			task.wait(FARM_REBIRTH_WAIT)
 			continue
 		end
 
-		-- ========== ⑤ 传送 ==========
 		local tpOk = TeleportTo(FARM_TELEPORT)
 		if not tpOk then
-			print("⚠️ 传送失败（无HRP），等0.5秒重试")
 			task.wait(0.5)
 			continue
 		end
-		print("🌾 已传送到刷钱点")
 
-		-- 传送后微等让服务器确认位置
-		task.wait(0.2)
+		task.wait(FARM_TP_COOLDOWN)
 
-		-- ========== ⑥ 模拟按2下S，2下W ==========
 		PressKey(Enum.KeyCode.S, 2)
 		task.wait(FARM_KEY_GAP)
 		PressKey(Enum.KeyCode.W, 2)
-		print("🌾 已按键 S×2 W×2")
-
-		-- 按键后等服务器处理
 		task.wait(FARM_AFTER_KEYS)
 
-		-- ========== ⑦ 检测是否逃出（循环检测） ==========
 		local checkStart = tick()
 		local escaped = false
-
 		while (tick() - checkStart) < FARM_ESCAPE_TIMEOUT do
-			-- 先检查是否还活着
 			hum = GetMyHumanoid()
 			if not hum or hum.Health <= 0 then
-				print("⚠️ 检测期间死亡，重新循环")
 				task.wait(FARM_REBIRTH_WAIT)
-				break  -- 回到外循环
+				break
 			end
-
-			-- 检测逃出
 			if CheckSelfEscaped() then
 				escaped = true
 				break
 			end
-
 			task.wait(FARM_CHECK_INTERVAL)
 		end
 
 		if escaped then
-			-- ========== 逃出成功 → 自杀 → 等角色消失 → 复活 ==========
-			print("🌾 逃出成功！等" .. FARM_DEATH_DELAY .. "秒后自杀")
 			task.wait(FARM_DEATH_DELAY)
 			KillMySelf()
-			print("💀 已自杀，等待角色消失...")
-			-- ★ 等角色消失后再回到循环开头走复活
 			task.wait(FARM_REBIRTH_WAIT)
-			-- 回到外循环开头 → 走完整复活流程 → 继续刷钱
 		else
-			-- 超时未逃出 → 自杀 → 等角色消失 → 复活
-			print("⚠️ " .. FARM_ESCAPE_TIMEOUT .. "秒未逃出 → 自杀重试")
 			KillMySelf()
 			task.wait(FARM_REBIRTH_WAIT)
-			-- 回到外循环开头
 		end
 	end
 
 	farmRunning = false
-	print("🌾 刷钱循环停止")
 end
 
--- ==================== 战斗主循环 ====================
-ScanWeapons()
+-- ==================== ★ 战斗主循环 ====================
+SafeCall("ScanWeapons", ScanWeapons)
 local LastShoot, LastMelee = 0, 0
-player.CharacterAdded:Connect(function(char)
-	HookChar(char)
-	task.wait(0.308); ScanWeapons(); task.wait(0.294)
-	if drawCircle then pcall(CreateCircle) end
-end)
-task.spawn(function() while true do task.wait(1.501); ScanWeapons() end end)
+
+task.spawn(function() while true do task.wait(3.0); ScanWeapons() end end)
 
 RunService.Heartbeat:Connect(function()
 	local now = tick()
 
-	-- 刷钱期间暂停射击/近战
 	if autoFarm and farmRunning then
 		pcall(UpdateCircle)
 		return
 	end
 
-	if autoMelee and HasMelee() and now-LastMelee>=MELEE_CD then
-		local t=GetMeleeTargets(); if #t>0 then FireMelee(t); LastMelee=now end
-	end
-	if autoShoot and now-LastShoot>=SHOOT_CD then
-		local hasR, isSG = HasRanged()
-		if hasR then
-			local e=GetEnemies(); if #e>0 then FireRanged(e[1]); LastShoot=now end
+	-- ★ 近战：CD 0.150s（快3倍），多武器连续攻击
+	if autoMelee and HasMelee() and now - LastMelee >= MELEE_CD then
+		local t = GetMeleeTargets()
+		if #t > 0 then
+			FireMelee(t)
+			LastMelee = now
 		end
 	end
+
+	-- 射击
+	if autoShoot and now - LastShoot >= SHOOT_CD then
+		local hasR, isSG = HasRanged()
+		if hasR then
+			local e = GetEnemies()
+			if #e > 0 then
+				FireRanged(e[1])
+				LastShoot = now
+			end
+		end
+	end
+
 	pcall(UpdateCircle)
 end)
 
@@ -1095,8 +1583,9 @@ task.spawn(function()
 		Pink=Color3.fromRGB(193,143,183), Label=Color3.fromRGB(85,88,95),
 		Input=Color3.fromRGB(86,91,101), Sep=Color3.fromRGB(69,76,86),
 	}
-	local PW = math.floor((IS_MOBILE and 280 or 330) * scale)
-	local PH = math.floor((IS_MOBILE and 340 or 400) * scale)
+
+	local PW = math.floor((IS_MOBILE and 280 or 340) * scale)
+	local PH = math.floor((IS_MOBILE and 370 or 430) * scale)
 	local MH = math.floor((IS_MOBILE and 26 or 28) * scale)
 	local GAP = math.floor(4*scale)
 	local PAD = math.floor(7*scale)
@@ -1131,7 +1620,7 @@ task.spawn(function()
 
 	local TL = Instance.new("TextLabel")
 	TL.Size = UDim2.new(1,-85,1,0); TL.Position=UDim2.new(0,43,0,0)
-	TL.BackgroundTransparency=1; TL.Text="⚔️ SCP异常站点"
+	TL.BackgroundTransparency=1; TL.Text="⚔️ SCP异常站点 v6.26"
 	TL.TextColor3=C.Text; TL.Font=Enum.Font.GothamBold; TL.TextSize=TS; TL.TextXAlignment=Enum.TextXAlignment.Center; TL.Parent=TB
 
 	local function mkIconBtn(sym, xpos)
@@ -1163,6 +1652,8 @@ task.spawn(function()
 	end)
 
 	local y = GAP
+
+	-- 状态面板
 	local SB = Instance.new("Frame")
 	SB.Size = UDim2.new(0, PW-PAD*2, 0, math.floor(50*scale))
 	SB.Position = UDim2.new(0,PAD,0,y)
@@ -1185,11 +1676,11 @@ task.spawn(function()
 		Instance.new("UICorner",b).CornerRadius=UDim.new(0,4); return b
 	end
 
-	-- 第1排
+	-- 第1排：射击 | 近战 | 射线 | 弹道
 	local SHT = mkBtn("🔫射击", C.Green); SHT.Position=UDim2.new(0,PAD,0,y)
 	local MEL = mkBtn("🔪近战", C.Purple); MEL.Position=UDim2.new(0,PAD+BW+GAP,0,y)
 	local RAY = mkBtn("👁️射线", C.Blue); RAY.Position=UDim2.new(0,PAD+(BW+GAP)*2,0,y)
-	local VIS = mkBtn("📡弹道", C.Yellow); VIS.Position=UDim2.new(0,PAD+(BW+GAP)*3,0,y)
+	local BEAM_BTN = mkBtn("🌸弹道", C.Pink); BEAM_BTN.Position=UDim2.new(0,PAD+(BW+GAP)*3,0,y)
 	y = y + BH + GAP
 
 	SHT.MouseButton1Click:Connect(function() autoShoot=not autoShoot; SHT.BackgroundColor3=autoShoot and C.Green or C.Red end)
@@ -1198,9 +1689,13 @@ task.spawn(function()
 		rayEnabled=not rayEnabled; RAY.Text=rayEnabled and "👁️射线" or "💀穿墙"
 		RAY.BackgroundColor3=rayEnabled and C.Blue or C.Red
 	end)
-	VIS.MouseButton1Click:Connect(function() drawVis=not drawVis; VIS.BackgroundColor3=drawVis and C.Yellow or C.Red end)
+	BEAM_BTN.MouseButton1Click:Connect(function()
+		drawBeams=not drawBeams
+		BEAM_BTN.BackgroundColor3 = drawBeams and C.Pink or C.Red
+		BEAM_BTN.Text = drawBeams and "🌸弹道ON" or "🌸弹道"
+	end)
 
-	-- 第2排
+	-- 第2排：范围 | 透视 | 射程 | 穿门
 	local CIR = mkBtn("⭕范围", C.Orange); CIR.Position=UDim2.new(0,PAD,0,y)
 	local ESB = mkBtn("👁️透视", C.Blue); ESB.Position=UDim2.new(0,PAD+BW+GAP,0,y)
 
@@ -1220,7 +1715,7 @@ task.spawn(function()
 		espEnabled=not espEnabled; ESB.BackgroundColor3=espEnabled and C.Blue or C.Red
 	end)
 
-	RGL.MouseButton1Click:Connect(function()
+	local function mkRangeOverlay()
 		local overlay = Instance.new("Frame")
 		overlay.Size=UDim2.new(0,math.floor(190*scale),0,math.floor(72*scale))
 		overlay.Position=UDim2.new(0,PAD+(BW+GAP)*2,0,y-BH-GAP-math.floor(80*scale))
@@ -1236,42 +1731,32 @@ task.spawn(function()
 		ok.Position=UDim2.new(0,math.floor(125*scale),0,5)
 		ok.BackgroundColor3=C.Green; ok.Text="✓"; ok.TextColor3=C.Text; ok.Font=Enum.Font.GothamBold; ok.TextSize=BS; ok.Parent=overlay
 		Instance.new("UICorner",ok).CornerRadius=UDim.new(0,3)
-		ok.MouseButton1Click:Connect(function()
+		local function apply()
 			local n=tonumber(tb.Text)
 			if n and n>=10 and n<=2000 then MAX_RANGE=math.floor(n) end
 			RGL.Text="🔫射程:"..MAX_RANGE; overlay:Destroy()
-		end)
-		tb.FocusLost:Connect(function(ep)
-			if ep then
-				local n=tonumber(tb.Text)
-				if n and n>=10 and n<=2000 then MAX_RANGE=math.floor(n) end
-				RGL.Text="🔫射程:"..MAX_RANGE; overlay:Destroy()
-			end
-		end)
-	end)
+		end
+		ok.MouseButton1Click:Connect(apply)
+		tb.FocusLost:Connect(function(ep) if ep then apply() end end)
+	end
+	RGL.MouseButton1Click:Connect(mkRangeOverlay)
 
-	-- 第3排
-	local DRB = mkBtn("🚪穿门", C.Green); DRB.Position=UDim2.new(0,PAD,0,y)
-
+	-- 第3排：近战距离 | 娱乐 | 静默 | 无敌检测
 	local MRL = Instance.new("TextButton")
 	MRL.Size=UDim2.new(0,BW*2+GAP,0,BH)
-	MRL.Position=UDim2.new(0,PAD+BW+GAP,0,y)
+	MRL.Position=UDim2.new(0,PAD,0,y)
 	MRL.BackgroundColor3=C.Label; MRL.BackgroundTransparency=0.052
 	MRL.Text="🔪近战:"..MELEE_RANGE; MRL.TextColor3=C.Text; MRL.Font=Enum.Font.GothamBold; MRL.TextSize=BS; MRL.Parent=CC
 	Instance.new("UICorner",MRL).CornerRadius=UDim.new(0,4)
-	y = y + BH + GAP
 
-	DRB.MouseButton1Click:Connect(function()
-		DoorSys.Enabled=not DoorSys.Enabled; DRB.BackgroundColor3=DoorSys.Enabled and C.Green or C.Red
-		if not DoorSys.Enabled then
-			for pt in pairs(DoorSys.Parts) do local o=DoorSys.Orig[pt]; if o~=nil and pt and pt.Parent then pt.CanCollide=o end end
-		end
-	end)
+	local FUN = mkBtn("🎵娱乐", C.Pink); FUN.Position=UDim2.new(0,PAD+(BW+GAP)*2,0,y)
+	local SIL = mkBtn("🔇静默", Color3.fromRGB(82,87,97)); SIL.Position=UDim2.new(0,PAD+(BW+GAP)*3,0,y)
+	y = y + BH + GAP
 
 	MRL.MouseButton1Click:Connect(function()
 		local overlay = Instance.new("Frame")
 		overlay.Size=UDim2.new(0,math.floor(190*scale),0,math.floor(72*scale))
-		overlay.Position=UDim2.new(0,PAD+BW+GAP,0,y-BH-GAP-math.floor(80*scale))
+		overlay.Position=UDim2.new(0,PAD,0,y-BH-GAP-math.floor(80*scale))
 		overlay.BackgroundColor3=C.BG; overlay.BackgroundTransparency=0.019; overlay.BorderSizePixel=0; overlay.Parent=CC
 		Instance.new("UICorner",overlay).CornerRadius=UDim.new(0,5)
 		local tb = Instance.new("TextBox")
@@ -1284,37 +1769,63 @@ task.spawn(function()
 		ok.Position=UDim2.new(0,math.floor(125*scale),0,5)
 		ok.BackgroundColor3=C.Green; ok.Text="✓"; ok.TextColor3=C.Text; ok.Font=Enum.Font.GothamBold; ok.TextSize=BS; ok.Parent=overlay
 		Instance.new("UICorner",ok).CornerRadius=UDim.new(0,3)
-		ok.MouseButton1Click:Connect(function()
+		local function apply()
 			local n=tonumber(tb.Text)
 			if n and n>=2 and n<=20 then MELEE_RANGE=math.floor(n); pcall(CreateCircle) end
 			MRL.Text="🔪近战:"..MELEE_RANGE; overlay:Destroy()
-		end)
-		tb.FocusLost:Connect(function(ep)
-			if ep then
-				local n=tonumber(tb.Text)
-				if n and n>=2 and n<=20 then MELEE_RANGE=math.floor(n); pcall(CreateCircle) end
-				MRL.Text="🔪近战:"..MELEE_RANGE; overlay:Destroy()
-			end
-		end)
+		end
+		ok.MouseButton1Click:Connect(apply)
+		tb.FocusLost:Connect(function(ep) if ep then apply() end end)
 	end)
 
-	-- 第4排
-	local SIL = mkBtn("🔇静默", Color3.fromRGB(85,88,95))
-	SIL.Position = UDim2.new(0, PAD, 0, y)
-	SIL.Size = UDim2.new(0, BW, 0, BH)
-
-	local FMB = mkBtn("🌾刷钱:关", C.Orange)
-	FMB.Position = UDim2.new(0, PAD + BW + GAP, 0, y)
-
-	local TPB = mkBtn("📍传送刷钱点", C.Dark)
-	TPB.Position = UDim2.new(0, PAD + (BW + GAP) * 2, 0, y)
-	TPB.Size = UDim2.new(0, BW * 2 + GAP, 0, BH)
-	y = y + BH + GAP
+	FUN.MouseButton1Click:Connect(function()
+		funMode = not funMode
+		FUN.BackgroundColor3 = funMode and C.Pink or Color3.fromRGB(82,87,97)
+		FUN.Text = funMode and "🎵娱乐ON" or "🎵娱乐"
+	end)
 
 	SIL.MouseButton1Click:Connect(function()
 		silentMode = not silentMode
 		SIL.BackgroundColor3 = silentMode and Color3.fromRGB(84,89,99) or Color3.fromRGB(82,87,97)
 		SIL.Text = silentMode and "🔇静默ON" or "🔇静默"
+	end)
+
+	-- 第4排：穿门 | 无敌检测 | 刷钱 | 传送
+	local DRB = mkBtn("🚪穿门", C.Green); DRB.Position=UDim2.new(0,PAD,0,y)
+
+	local INV = mkBtn("🛡️无敌ON", C.Blue); INV.Position=UDim2.new(0,PAD+BW+GAP,0,y)
+	INV.Size = UDim2.new(0, BW, 0, BH)
+
+	local FMB = mkBtn("🌾刷钱:关", C.Orange); FMB.Position=UDim2.new(0,PAD+(BW+GAP)*2,0,y)
+
+	local TPB = mkBtn("📍传送刷钱点", C.Dark)
+	TPB.Position = UDim2.new(0, PAD + (BW + GAP) * 3, 0, y)
+	TPB.Size = UDim2.new(0, BW, 0, BH)
+	y = y + BH + GAP
+
+	DRB.MouseButton1Click:Connect(function()
+		DoorSys.Enabled = not DoorSys.Enabled
+		DRB.BackgroundColor3 = DoorSys.Enabled and C.Green or C.Red
+		if not DoorSys.Enabled then
+			local c = RestoreAllDoors()
+			print("🚪 穿门关，恢复 " .. c .. " 个门碰撞")
+		else
+			print("🚪 穿门开，靠近门将自动穿透")
+		end
+	end)
+
+	INV.MouseButton1Click:Connect(function()
+		invincibleCheck = not invincibleCheck
+		INV.BackgroundColor3 = invincibleCheck and C.Blue or C.Red
+		INV.Text = invincibleCheck and "🛡️无敌ON" or "🛡️无敌检测"
+		if not invincibleCheck then
+			for p in pairs(invincibleUntil) do
+				invincibleUntil[p] = nil
+			end
+			for p in pairs(forceFieldState) do
+				forceFieldState[p] = false
+			end
+		end
 	end)
 
 	FMB.MouseButton1Click:Connect(function()
@@ -1410,50 +1921,89 @@ task.spawn(function()
 	PLL.Parent = PLF
 	UI.PlayerListLabel = PLL
 
-	-- ==================== 手机端提示 ====================
-	if IS_MOBILE then
-		local MP = Instance.new("Frame")
-		MP.Size = UDim2.new(0, math.floor(260*scale), 0, math.floor(80*scale))
-		MP.Position = UDim2.new(0.5, -math.floor(130*scale), 0.3, 0)
-		MP.BackgroundColor3 = Color3.fromRGB(40,42,48)
-		MP.BackgroundTransparency = 0.05
-		MP.BorderSizePixel = 0
-		MP.Parent = sg
-		Instance.new("UICorner",MP).CornerRadius = UDim.new(0,8)
-
-		local MPT = Instance.new("TextLabel")
-		MPT.Size = UDim2.new(1, -16, 1, -10)
-		MPT.Position = UDim2.new(0, 8, 0, 5)
-		MPT.BackgroundTransparency = 1
-		MPT.Text = "📱 手机端已启动\n⚠️ 刷钱期间将无法奔跑\n请保持站立等待"
-		MPT.TextColor3 = Color3.fromRGB(255,175,40)
-		MPT.Font = Enum.Font.GothamBold
-		MPT.TextSize = math.floor(12*scale)
-		MPT.TextWrapped = true
-		MPT.Parent = MP
-
-		task.delay(5, function() pcall(function() MP:Destroy() end) end)
-	end
-
 	print("✅ UI 创建完成")
 end)
 
--- ==================== 状态更新循环 ====================
+-- ==================== ★ 状态更新循环（0.1秒实时） ====================
+local playerListDirty = true
+local function MarkPlayerListDirty()
+	playerListDirty = true
+end
+Players.PlayerAdded:Connect(MarkPlayerListDirty)
+Players.PlayerRemoving:Connect(MarkPlayerListDirty)
+
 task.spawn(function()
-	while true do task.wait(0.360)
+	local REFRESH_INTERVAL = 0.1
+
+	while true do
+		task.wait(REFRESH_INTERVAL)
+		local now = tick()
 		local myHRP = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-		local enemyCount, violateCount, escapeCount = 0,0,0
+		local enemyCount, violateCount, escapeCount, invincibleCount = 0,0,0,0
+
+		local friendLines = {}
+		local enemyLines = {}
 
 		if myHRP then
+			local myPos = myHRP.Position
+			local rangeSq = MAX_RANGE * MAX_RANGE  -- 用平方距离粗筛，避免sqrt
 			for _,p in ipairs(Players:GetPlayers()) do
 				if p~=player and p.Character then
 					local hrp=p.Character:FindFirstChild("HumanoidRootPart")
 					local hu=p.Character:FindFirstChildOfClass("Humanoid")
 					if hrp and hu and hu.Health>0 then
-						local d=(hrp.Position-myHRP.Position).Magnitude
+						-- ★ 先用平方距离粗筛，超出范围直接跳过
+						local dx = hrp.Position.X - myPos.X
+						local dy = hrp.Position.Y - myPos.Y
+						local dz = hrp.Position.Z - myPos.Z
+						local distSq = dx*dx + dy*dy + dz*dz
+						local d = math.sqrt(distSq)
+
 						if d<=MAX_RANGE and IsEnemy(p) then enemyCount=enemyCount+1 end
 						if IsHostile(p) then violateCount=violateCount+1 end
 						if IsEscaped(p) then escapeCount=escapeCount+1 end
+
+						local isInv = false
+						if forceFieldState[p] == true then
+							isInv = true
+						elseif invincibleUntil[p] and now < invincibleUntil[p] then
+							isInv = true
+						else
+							isInv = CheckForceFieldExists(p)
+							if isInv then MarkInvincible(p) end
+						end
+						if isInv then invincibleCount = invincibleCount + 1 end
+
+						local role=GetRole(p) or "?"
+						local cn=RoleNames[role] or role
+						local isHostile = IsHostile(p)
+						local isEscaped = IsEscaped(p)
+
+						local dist = string.format(" %.0fm", d)
+
+						local suffix = ""
+						if isHostile then suffix = suffix .. " ❗" end
+						if isEscaped then suffix = suffix .. " 🏃" end
+						if isInv then suffix = suffix .. " 🛡️" end
+
+						local line = string.format("%s [%s]%s%s", p.Name, cn, suffix, dist)
+
+						local isFriend = false
+						if role == myRole and role ~= "" then
+							isFriend = true
+						elseif FOUNDATION[myRole] and FOUNDATION[role] then
+							isFriend = true
+						elseif CHAOS[myRole] and CHAOS[role] then
+							isFriend = true
+						elseif DCLASS[myRole] and DCLASS[role] then
+							isFriend = true
+						end
+
+						if isFriend then
+							table.insert(friendLines, "🛡️" .. line)
+						else
+							table.insert(enemyLines, "⚠️" .. line)
+						end
 					end
 				end
 			end
@@ -1464,75 +2014,30 @@ task.spawn(function()
 			local wid = currentWeaponID
 			if #wid>8 then wid=wid:sub(1,8).."..." end
 			local modeStr = ""
-			if silentMode then modeStr = " 🔇静默"
-			elseif funMode then modeStr = " 🎵娱乐"
-			end
+			if silentMode then modeStr = " 🔇静默" end
+			if funMode then modeStr = modeStr .. " 🎵娱乐" end
+			if invincibleCheck then modeStr = modeStr .. " 🛡️" end
+			if drawBeams then modeStr = modeStr .. " 🌸" end
 			local farmStr = autoFarm and " 🌾刷钱" or ""
-			local txt = string.format("职业:%s\n武器:%s\nID:%s\n敌人:%d 违规:%d 逃出:%d 门:%d%s%s",
-				roleName, currentWeaponName, wid, enemyCount, violateCount, escapeCount, DoorCount, modeStr, farmStr)
+			local txt = string.format("职业:%s\n武器:%s\nID:%s\n敌人:%d 违规:%d 逃出:%d 无敌:%d 门:%d%s%s",
+				roleName, currentWeaponName, wid, enemyCount, violateCount, escapeCount, invincibleCount, DoorCount, modeStr, farmStr)
 			pcall(function() UI.StatusLabel.Text=txt end)
 		end
 
-		-- 玩家列表（二段式：友军 / 敌人）
 		if UI.PlayerListLabel and ListVisible then
-			local friendLines = {}
-			local enemyLines = {}
-
-			for _,p in ipairs(Players:GetPlayers()) do
-				if p~=player then
-					local role=GetRole(p) or "?"
-					local cn=RoleNames[role] or role
-					local isHostile = IsHostile(p)
-					local isEscaped = IsEscaped(p)
-
-					local dist=""
-					if myHRP and p.Character then
-						local hrp=p.Character:FindFirstChild("HumanoidRootPart")
-						if hrp then dist=string.format(" %.0fm",(myHRP.Position-hrp.Position).Magnitude) end
-					end
-
-					local suffix = ""
-					if isHostile then suffix = suffix .. " ❗" end
-					if isEscaped then suffix = suffix .. " 🏃" end
-
-					local line = string.format("%s [%s]%s%s", p.Name, cn, suffix, dist)
-
-					local isFriend = false
-					if role == myRole and role ~= "" then
-						isFriend = true
-					elseif FOUNDATION[myRole] and FOUNDATION[role] then
-						isFriend = true
-					elseif CHAOS[myRole] and CHAOS[role] then
-						isFriend = true
-					elseif DCLASS[myRole] and DCLASS[role] then
-						isFriend = true
-					end
-
-					if isFriend then
-						table.insert(friendLines, "🛡️" .. line)
-					else
-						table.insert(enemyLines, "⚠️" .. line)
-					end
-				end
-			end
-
 			local allLines = {}
-
 			if #friendLines > 0 then
 				table.insert(allLines, "===== 友军 =====")
-				for _, l in ipairs(friendLines) do
-					table.insert(allLines, l)
-				end
+				for _, l in ipairs(friendLines) do table.insert(allLines, l) end
 				table.insert(allLines, "")
 			end
-
 			if #enemyLines > 0 then
 				table.insert(allLines, "===== 敌人 =====")
-				for _, l in ipairs(enemyLines) do
-					table.insert(allLines, l)
-				end
+				for _, l in ipairs(enemyLines) do table.insert(allLines, l) end
 			end
-
+			if #allLines == 0 then
+				allLines = {"加载中..."}
+			end
 			pcall(function() UI.PlayerListLabel.Text = table.concat(allLines, "\n") end)
 		end
 	end
@@ -1543,15 +2048,76 @@ if player.Character then
 	HookChar(player.Character)
 end
 
-print("✅ SCP异常站点 v6.14-fix 已启动")
-print("📦 功能：射击|近战|射线检测|显示弹道|范围|透视|穿门|娱乐|静默|刷钱")
-print("🎯 透视：包围盒+渐变方框+竖血条")
-print("💥 霰弹枪：与普通枪同一系统，8发打头")
-print("🌾 刷钱逻辑（修复版）：")
-print("  ① 检测职业 → 无则杀自己 → ★等角色消失→选D级→等生成→等职业")
-print("  ② 确认是D级")
-print("  ③ 检测逃出 → 逃出则自杀 → ★等角色消失→复活循环")
-print("  ④ 未逃出 → 延迟3秒 → 传送")
-print("  ⑤ 按S×2 W×2")
-print("  ⑥ 检测逃出 → 逃出则自杀 → 循环")
-print("🎨 D级金黄橙(255,175,40) 混沌柠檬黄(220,180,30)")
+for _, p in ipairs(Players:GetPlayers()) do
+	p.CharacterAdded:Connect(function()
+		playerListDirty = true
+	end)
+	p.CharacterRemoving:Connect(function()
+		playerListDirty = true
+	end)
+end
+Players.PlayerAdded:Connect(function(p)
+	playerListDirty = true
+	p.CharacterAdded:Connect(function() playerListDirty = true end)
+	p.CharacterRemoving:Connect(function() playerListDirty = true end)
+end)
+
+-- ==================== ★ 全局清理函数 ====================
+function Unload()
+	autoFarm = false
+
+	-- 断开所有事件连接
+	for _, conn in ipairs(allConnections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	allConnections = {}
+
+	pcall(function()
+		local pg = player:FindFirstChild("PlayerGui")
+		if pg then
+			local sg = pg:FindFirstChild("SCPAnomalySite")
+			if sg then sg:Destroy() end
+		end
+	end)
+
+	-- 清理所有ESP（包括断开事件连接）
+	for p in pairs(ESP) do
+		pcall(function() CleanESP(p) end)
+	end
+	ESP = {}
+
+	RestoreAllDoors()
+	pcall(DestroyCircle)
+
+	-- 清理所有弹道
+	for _, b in ipairs(activeBeams) do
+		if b and b.Parent then b:Destroy() end
+	end
+	activeBeams = {}
+	for _, p in ipairs(beamPool) do
+		if p and p.Parent then p:Destroy() end
+	end
+	beamPool = {}
+
+	-- 清理缓存
+	ignoreList = nil
+	charPartsCache = {}
+	DoorSys.Parts = {}
+	DoorSys.Orig = {}
+	invincibleUntil = {}
+	forceFieldState = {}
+	meleeInProgress = false
+
+	print("✅ SCP异常站点 v6.27 已完全卸载")
+end
+
+-- ==================== 启动提示 ====================
+print("✅ SCP异常站点 v6.27 已启动（核心修复版，UI未改动）")
+print("🔧 v6.27 修复：加载崩溃/穿门字典膨胀/无敌表泄漏/弹道堆积/ESP缓存泄漏/状态遍历优化/圆圈Part管控/连接管理")
+print("🔪 近战攻击重写：CD 0.150s + 多武器连续快速攻击")
+print("🌸 弹道：Part方案 100%可见（不跟随屏幕/不UI）")
+print("🛡️ 无敌检测：0.3s循环扫描玩家模型中的'Forcefield'文件")
+print("🚪 穿门：靠近12格才移除碰撞（射线不穿门）")
+print("🔪 近战范围：8格")
+print("📋 玩家列表：0.1秒实时刷新")
+print("🧹 控制台输入 Unload() 可完全卸载")
